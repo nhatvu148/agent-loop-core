@@ -1,0 +1,24 @@
+[package]
+name = "agent-core"
+description = "Shared agent-harness primitives: typed errors and a resilient chat-completions client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Not published yet. See the step 6 decision: publish as a support crate (which
+# pr-review-core needs in order to resume crates.io releases), or keep it
+# internal permanently.
+publish = false
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"
