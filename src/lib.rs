@@ -34,7 +34,11 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod events;
 pub mod provider;
+pub mod tools;
 
 pub use error::AgentError;
+pub use events::{AgentEvent, EventSink, StopReason};
 pub use provider::{ChatClient, ProviderConfig, RetryPolicy};
+pub use tools::{ErasedTool, Tool, ToolError, ToolOutput, ToolRegistry};
