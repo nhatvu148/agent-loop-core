@@ -56,6 +56,9 @@ pub enum AgentEvent {
         call_id: String,
         ok: bool,
         duration_ms: u64,
+        /// Leading characters of the result, for a UI that shows it inline.
+        /// Always present — an empty result is an empty string, not absence.
+        output_preview: String,
     },
     /// Every tool call in this turn has been executed.
     TurnComplete { turn: u32, tools_executed: u32 },

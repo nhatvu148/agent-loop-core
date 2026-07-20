@@ -22,12 +22,27 @@ use crate::events::{AgentEvent, EventSink, StopReason};
 use crate::provider::ChatClient;
 use crate::tools::ToolRegistry;
 
+/// Decides whether a tool call may run.
+///
+/// The loop asks for **every** tool call when an approver is set; the policy of
+/// which tools actually need a human lives with the implementor. vexar gates
+/// `edit`/`write`/`bash`; a headless caller can approve everything. Keeping the
+/// policy here rather than in the loop means the loop never has to know which
+/// tool names are dangerous in a given host.
+#[async_trait::async_trait]
+pub trait ToolApprover: Send + Sync {
+    /// Return `false` to reject. A rejection is reported to the model as a tool
+    /// result, not an error — the agent can choose another route.
+    async fn approve(&self, tool: &str, args: &Value) -> bool;
+}
+
 /// A backend that drives the loop itself against an OpenAI-compatible endpoint.
 pub struct ChatBackend {
     chat: ChatClient,
     tools: Arc<ToolRegistry>,
     policy: ModelPolicy,
     interrupt: Arc<AtomicBool>,
+    approver: Option<Arc<dyn ToolApprover>>,
 }
 
 impl ChatBackend {
@@ -46,7 +61,19 @@ impl ChatBackend {
             tools,
             policy,
             interrupt: Arc::new(AtomicBool::new(false)),
+            approver: None,
         }
+    }
+
+    /// Gate tool execution behind an approver.
+    ///
+    /// Without one, every tool runs. That is the right default for a library
+    /// caller, and the wrong one for an interactive host — vexar must set this
+    /// or it loses the confirmation gate on `edit`/`write`/`bash`.
+    #[must_use]
+    pub fn with_approver(mut self, approver: Arc<dyn ToolApprover>) -> Self {
+        self.approver = Some(approver);
+        self
     }
 
     /// Share an interrupt flag so a caller can cancel a run in flight.
@@ -100,6 +127,20 @@ impl ChatBackend {
             .ok_or_else(|| AgentError::Decode("response had no choices[0].message".into()))?;
         Ok((message, tokens))
     }
+}
+
+/// Parse a model-supplied `arguments` string once, for both the approver and
+/// dispatch. Mirrors `ToolRegistry::call_raw_args`, which this replaces at the
+/// call site so the string is not parsed twice.
+fn parse_tool_args(tool: &str, arguments: &str) -> Result<Value, crate::tools::ToolError> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(trimmed).map_err(|e| crate::tools::ToolError::InvalidArguments {
+        tool: tool.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// Append placeholder responses for tool calls that never ran.
@@ -297,8 +338,31 @@ impl Backend for ChatBackend {
                     tool: name.clone(),
                     call_id: id.clone(),
                 });
+                // Parsed once and shared: parsing separately for the approver
+                // meant malformed JSON reached it as `Null`, so an approver that
+                // inspects arguments to decide would see nothing while dispatch
+                // rejected the same call for being invalid.
+                let parsed = parse_tool_args(&name, args);
+
+                let approved = match (&self.approver, &parsed) {
+                    (Some(a), Ok(v)) => a.approve(&name, v).await,
+                    // Unparseable arguments are rejected by dispatch below;
+                    // there is nothing meaningful to approve.
+                    (Some(_), Err(_)) => true,
+                    (None, _) => true,
+                };
+
+                // Timed after the approval decision: an interactive approver
+                // waits on a human, and folding that into duration_ms would
+                // report think-time as tool latency.
                 let t0 = Instant::now();
-                let result = self.tools.call_raw_args(&name, args).await;
+                let result = match (approved, parsed) {
+                    (true, Ok(v)) => self.tools.call(&name, v).await,
+                    (true, Err(e)) => Err(e),
+                    (false, _) => Ok(crate::tools::ToolOutput::error(
+                        "Tool execution was rejected by the user.",
+                    )),
+                };
                 let duration_ms = t0.elapsed().as_millis() as u64;
 
                 let output = match result {
@@ -311,6 +375,7 @@ impl Backend for ChatBackend {
                             call_id: id.clone(),
                             ok: false,
                             duration_ms,
+                            output_preview: clip(&e.to_string(), 100),
                         });
                         // This call *did* run — persist its real error, so the
                         // resumed transcript says what actually went wrong. Only
@@ -341,6 +406,7 @@ impl Backend for ChatBackend {
                     call_id: id.clone(),
                     ok: !output.is_error,
                     duration_ms,
+                    output_preview: clip(&output.content, 100),
                 });
                 messages.push(json!({
                     "role": "tool",
@@ -757,6 +823,158 @@ mod tests {
             .any(|e| matches!(e, AgentEvent::Warning { message, .. } if message.contains("ecoh")));
         assert!(warned, "a typo in the scope list must be visible");
         assert_eq!(seq.requests()[0]["tools"].as_array().unwrap().len(), 1);
+    }
+
+    // ---- approval gate -----------------------------------------------------
+
+    struct DenyAll;
+    #[async_trait]
+    impl ToolApprover for DenyAll {
+        async fn approve(&self, _: &str, _: &Value) -> bool {
+            false
+        }
+    }
+
+    struct RecordingApprover(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl ToolApprover for RecordingApprover {
+        async fn approve(&self, tool: &str, args: &Value) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{tool}:{}", args["text"].as_str().unwrap_or("")));
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_tool_is_reported_to_the_model_and_the_loop_continues() {
+        let (srv, seq) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"danger"}"#)], 1),
+            text_turn("understood", 1),
+        ])
+        .await;
+        let b = backend(&srv.uri(), ModelPolicy::single("m")).with_approver(Arc::new(DenyAll));
+        let out = b.run(req(), EventSink::none()).await.unwrap();
+
+        assert_eq!(out.stop_reason, StopReason::Complete);
+        let tool_msg = seq.requests()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap()
+            .clone();
+        assert!(
+            tool_msg["content"].as_str().unwrap().contains("rejected"),
+            "got {tool_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_approver_sees_the_tool_name_and_parsed_arguments() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (srv, _s) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"hi"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        let b = backend(&srv.uri(), ModelPolicy::single("m"))
+            .with_approver(Arc::new(RecordingApprover(Arc::clone(&seen))));
+        b.run(req(), EventSink::none()).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["echo:hi"]);
+    }
+
+    #[tokio::test]
+    async fn without_an_approver_every_tool_runs() {
+        let (srv, seq) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"x"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        backend(&srv.uri(), ModelPolicy::single("m"))
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+        let tool_msg = seq.requests()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap()
+            .clone();
+        assert_eq!(tool_msg["content"], "echo: x");
+    }
+
+    struct SlowApprover;
+    #[async_trait]
+    impl ToolApprover for SlowApprover {
+        async fn approve(&self, _: &str, _: &Value) -> bool {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_wait_is_not_counted_as_tool_latency() {
+        // An interactive approver waits on a human. Folding that into
+        // duration_ms would report think-time as tool latency.
+        let (srv, _s) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"x"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        let (sink, mut rx) = EventSink::channel();
+        backend(&srv.uri(), ModelPolicy::single("m"))
+            .with_approver(Arc::new(SlowApprover))
+            .run(req(), sink)
+            .await
+            .unwrap();
+
+        let d = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|e| match e {
+                AgentEvent::ToolComplete { duration_ms, .. } => Some(duration_ms),
+                _ => None,
+            })
+            .expect("a ToolComplete was emitted");
+        assert!(d < 100, "duration_ms {d} includes the 120ms approval wait");
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_skip_approval_and_reach_the_model_as_an_error() {
+        // Arguments are parsed once. Previously the approver got `Null` for
+        // unparseable JSON while dispatch rejected the same call, so an
+        // approver inspecting arguments saw nothing.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (srv, seq) = server(vec![
+            tool_turn(&[("c1", "echo", "{not json")], 1),
+            text_turn("understood", 1),
+        ])
+        .await;
+        backend(&srv.uri(), ModelPolicy::single("m"))
+            .with_approver(Arc::new(RecordingApprover(Arc::clone(&seen))))
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing meaningful to approve; dispatch rejects it"
+        );
+        let tool_msg = seq.requests()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap()
+            .clone();
+        assert!(
+            tool_msg["content"]
+                .as_str()
+                .unwrap()
+                .contains("invalid arguments"),
+            "got {tool_msg}"
+        );
     }
 
     // ---- streaming is optional --------------------------------------------

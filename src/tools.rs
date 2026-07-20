@@ -96,8 +96,10 @@ pub trait Tool: Send + Sync + 'static {
 /// Object-safe view of a [`Tool`], used for storage and dispatch.
 #[async_trait]
 pub trait ErasedTool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    /// Not `&'static str`: MCP servers name their tools over the wire, and an
+    /// adapter around a legacy tool borrows its name from the wrapped value.
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     /// JSON Schema of the arguments, derived from `Tool::Args`.
     fn schema(&self) -> Value;
     /// OpenAI function-calling definition.
@@ -118,11 +120,11 @@ pub trait ErasedTool: Send + Sync {
 
 #[async_trait]
 impl<T: Tool> ErasedTool for T {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         Tool::name(self)
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         Tool::description(self)
     }
 
@@ -160,7 +162,7 @@ fn sanitize_schema(mut schema: Value) -> Value {
 /// which is the property that removes drift.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: HashMap<&'static str, Arc<dyn ErasedTool>>,
+    tools: HashMap<String, Arc<dyn ErasedTool>>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -179,13 +181,37 @@ impl ToolRegistry {
 
     /// Register a tool. A duplicate name replaces the earlier registration.
     pub fn register<T: Tool>(&mut self, tool: T) {
-        self.tools.insert(Tool::name(&tool), Arc::new(tool));
+        self.tools
+            .insert(Tool::name(&tool).to_string(), Arc::new(tool));
     }
 
     /// Builder form of [`ToolRegistry::register`].
     #[must_use]
     pub fn with<T: Tool>(mut self, tool: T) -> Self {
         self.register(tool);
+        self
+    }
+
+    /// Register a tool whose schema is only known at runtime.
+    ///
+    /// [`Tool`] derives its schema from a compile-time `Args` type, which is
+    /// what removes drift — prefer it. But some tools genuinely cannot: MCP
+    /// servers advertise their schemas over the wire, and an adapter wrapping a
+    /// legacy dynamically-typed tool has no `Args` type to name. Those
+    /// implement [`ErasedTool`] directly.
+    ///
+    /// The drift guarantee still holds *structurally*: this is the same map
+    /// that dispatches, so an advertised tool is always callable. What is given
+    /// up is the compile-time link between the advertised schema and the
+    /// arguments the tool actually reads.
+    pub fn register_erased(&mut self, tool: Arc<dyn ErasedTool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Builder form of [`ToolRegistry::register_erased`].
+    #[must_use]
+    pub fn with_erased(mut self, tool: Arc<dyn ErasedTool>) -> Self {
+        self.register_erased(tool);
         self
     }
 
@@ -201,8 +227,8 @@ impl ToolRegistry {
 
     /// Registered names, sorted — so prompts and snapshots are deterministic.
     #[must_use]
-    pub fn names(&self) -> Vec<&'static str> {
-        let mut n: Vec<_> = self.tools.keys().copied().collect();
+    pub fn names(&self) -> Vec<&str> {
+        let mut n: Vec<&str> = self.tools.keys().map(String::as_str).collect();
         n.sort_unstable();
         n
     }
@@ -234,7 +260,7 @@ impl ToolRegistry {
         let mut defs = Vec::new();
         let mut missing = Vec::new();
         for n in names {
-            match self.tools.get(n) {
+            match self.tools.get(*n) {
                 Some(t) => defs.push(t.definition()),
                 None => missing.push((*n).to_string()),
             }
@@ -563,6 +589,51 @@ mod tests {
         let r = ToolRegistry::new().with(Ping).with(Ping);
         assert_eq!(r.len(), 1);
         assert_eq!(r.definitions().len(), 1);
+    }
+
+    struct DynamicTool;
+
+    #[async_trait]
+    impl ErasedTool for DynamicTool {
+        fn name(&self) -> &'static str {
+            "dynamic"
+        }
+        fn description(&self) -> &'static str {
+            "Schema known only at runtime."
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"]})
+        }
+        async fn call_erased(&self, raw: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok(format!("dynamic {}", raw["q"])))
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_schema_tools_can_be_registered_and_dispatched() {
+        // MCP servers advertise schemas over the wire; an adapter around a
+        // legacy dynamically-typed tool has no Args type. Both need this.
+        let r = ToolRegistry::new().with_erased(Arc::new(DynamicTool));
+        let defs = r.definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["function"]["name"], "dynamic");
+        assert_eq!(defs[0]["function"]["parameters"]["required"][0], "q");
+
+        let out = r.call("dynamic", json!({"q": "hi"})).await.unwrap();
+        assert_eq!(out.content, r#"dynamic "hi""#);
+    }
+
+    #[tokio::test]
+    async fn erased_and_typed_tools_coexist_in_one_registry() {
+        let r = ToolRegistry::new()
+            .with(Ping)
+            .with_erased(Arc::new(DynamicTool));
+        assert_eq!(r.names(), vec!["dynamic", "ping"]);
+        // Structural drift guarantee still holds: everything advertised
+        // dispatches, because it is the same map.
+        for def in r.definitions() {
+            assert!(r.contains(def["function"]["name"].as_str().unwrap()));
+        }
     }
 
     #[test]
