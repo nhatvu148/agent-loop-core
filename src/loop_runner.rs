@@ -444,9 +444,14 @@ impl Backend for ChatBackend {
             });
         };
 
-        // Only a natural finish earns a synthesis pass. Stopping on a limit or
-        // an interrupt means the caller asked us to stop spending.
-        if stop != StopReason::Complete || !self.policy.is_tiered() {
+        // A tiered run synthesizes once exploration is *done* — whether it
+        // finished naturally or hit the turn cap. Both mean "gather no more,
+        // now produce the answer from what you have"; a batch consumer still
+        // wants a result at the cap. A hard stop (interrupt / token / time
+        // budget) does skip synthesis: those mean "stop spending", and an
+        // untiered run has no separate synthesis model to call.
+        let exploration_done = matches!(stop, StopReason::Complete | StopReason::MaxTurns(_));
+        if !exploration_done || !self.policy.final_synthesis {
             return Ok(finish(turn, total_tokens, stop, messages, content));
         }
 
@@ -507,13 +512,11 @@ impl Backend for ChatBackend {
             tools_executed: 0,
         });
 
-        Ok(finish(
-            turn,
-            total_tokens,
-            StopReason::Complete,
-            messages,
-            content,
-        ))
+        // Preserve why exploration stopped. A run that synthesized after the
+        // turn cap still reports MaxTurns, not Complete — the answer exists, but
+        // it was produced from capped context, and a caller should be able to
+        // tell.
+        Ok(finish(turn, total_tokens, stop, messages, content))
     }
 }
 
@@ -716,11 +719,14 @@ mod tests {
     // ---- termination -------------------------------------------------------
 
     #[tokio::test]
-    async fn hitting_the_turn_cap_skips_synthesis() {
-        // Stopping on a limit means the caller asked us to stop spending, so
-        // the loop must not then make an expensive strong-model call.
+    async fn hitting_the_turn_cap_still_synthesises() {
+        // The turn cap means "gather no more", not "abandon the run". A tiered
+        // batch consumer (e.g. a PR reviewer) still wants the final answer from
+        // whatever was gathered, so synthesis runs — but the outcome reports
+        // MaxTurns, not Complete, so the cap is visible.
         let responses = (0..6)
             .map(|i| tool_turn(&[(&format!("c{i}"), "echo", r#"{"text":"x"}"#)], 1))
+            .chain(std::iter::once(text_turn(r#"{"ok":true}"#, 1)))
             .collect();
         let (srv, seq) = server(responses).await;
         let mut p = tiered();
@@ -730,8 +736,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(seq.calls(), 2, "no synthesis call after a limit stop");
-        assert_eq!(out.stop_reason, StopReason::MaxTurns(2));
+        assert_eq!(seq.calls(), 3, "2 explore turns capped, then 1 synthesis");
+        assert_eq!(
+            out.stop_reason,
+            StopReason::MaxTurns(2),
+            "the cap is preserved even though we synthesized"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hard_stop_still_skips_synthesis() {
+        // The distinction the change turns on: a token/time/interrupt budget is
+        // "stop spending", so synthesis does NOT run, unlike the turn cap.
+        let (srv, seq) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"x"}"#)], 100),
+            tool_turn(&[("c2", "echo", r#"{"text":"y"}"#)], 100),
+        ])
+        .await;
+        let mut p = tiered();
+        p.stop_after_tokens = Some(50);
+        let out = backend(&srv.uri(), p)
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+
+        assert_eq!(seq.calls(), 1, "no synthesis after a token-budget stop");
+        assert_eq!(out.stop_reason, StopReason::MaxTokens(50));
     }
 
     #[tokio::test]

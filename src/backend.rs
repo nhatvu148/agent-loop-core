@@ -45,6 +45,17 @@ pub struct ModelPolicy {
     pub max_history_chars: usize,
     /// Whether a failing tool aborts the run or is fed back to the model.
     pub continue_on_tool_error: bool,
+    /// Whether to run a final tools-forbidden synthesis turn once exploration is
+    /// done.
+    ///
+    /// This is separate from tiering. A tiered run (cheap explore, strong
+    /// synthesize) obviously wants it. But a *single-model* run can want it too:
+    /// a caller that needs clean structured output uses the synthesis turn to
+    /// say "now produce only the JSON, no tools", even on the same model. And a
+    /// caller whose ordinary loop completion already *is* the answer (an
+    /// interactive assistant) wants it off, to avoid a redundant call. `single`
+    /// defaults it off, `tiered` on; set it explicitly when neither fits.
+    pub final_synthesis: bool,
 }
 
 impl Default for ModelPolicy {
@@ -60,28 +71,32 @@ impl Default for ModelPolicy {
             initial_tool_choice: "auto".to_string(),
             max_history_chars: 45_000,
             continue_on_tool_error: true,
+            final_synthesis: false,
         }
     }
 }
 
 impl ModelPolicy {
-    /// Single-model policy — `explore` and `synthesize` are the same.
+    /// Single-model policy — `explore` and `synthesize` are the same, and the
+    /// loop's own completion is the answer (no separate synthesis turn).
     #[must_use]
     pub fn single(model: impl Into<String>) -> Self {
         let m = model.into();
         Self {
             explore: m.clone(),
             synthesize: m,
+            final_synthesis: false,
             ..Self::default()
         }
     }
 
-    /// Two-tier policy: cheap exploration, strong synthesis.
+    /// Two-tier policy: cheap exploration, then a strong-model synthesis turn.
     #[must_use]
     pub fn tiered(explore: impl Into<String>, synthesize: impl Into<String>) -> Self {
         Self {
             explore: explore.into(),
             synthesize: synthesize.into(),
+            final_synthesis: true,
             ..Self::default()
         }
     }
