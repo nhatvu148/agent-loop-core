@@ -31,9 +31,19 @@ use crate::tools::ToolRegistry;
 /// tool names are dangerous in a given host.
 #[async_trait::async_trait]
 pub trait ToolApprover: Send + Sync {
+    /// Whether this tool needs a human decision at all. The default asks about
+    /// everything; a host that only gates destructive tools overrides this so
+    /// the loop skips the prompt (and the `ToolApprovalRequired` event) for the
+    /// rest.
+    fn needs_approval(&self, _tool: &str) -> bool {
+        true
+    }
+
     /// Return `false` to reject. A rejection is reported to the model as a tool
-    /// result, not an error — the agent can choose another route.
-    async fn approve(&self, tool: &str, args: &Value) -> bool;
+    /// result, not an error — the agent can choose another route. `call_id` is
+    /// the model's id for this call, so an approver can correlate a prompt with
+    /// its answer.
+    async fn approve(&self, tool: &str, call_id: &str, args: &Value) -> bool;
 }
 
 /// A backend that drives the loop itself against an OpenAI-compatible endpoint.
@@ -276,8 +286,13 @@ impl Backend for ChatBackend {
             sink.emit(AgentEvent::TurnStart { turn });
             trim_history(&mut messages, self.policy.max_history_chars);
 
+            let tool_choice = if turn == 1 {
+                self.policy.initial_tool_choice.as_str()
+            } else {
+                "auto"
+            };
             let (message, tokens) = self
-                .chat_once(&self.policy.explore, &messages, &tools, "auto")
+                .chat_once(&self.policy.explore, &messages, &tools, tool_choice)
                 .await?;
             total_tokens += tokens;
             if tokens > 0 {
@@ -345,11 +360,19 @@ impl Backend for ChatBackend {
                 let parsed = parse_tool_args(&name, args);
 
                 let approved = match (&self.approver, &parsed) {
-                    (Some(a), Ok(v)) => a.approve(&name, v).await,
-                    // Unparseable arguments are rejected by dispatch below;
-                    // there is nothing meaningful to approve.
-                    (Some(_), Err(_)) => true,
-                    (None, _) => true,
+                    (Some(a), Ok(v)) if a.needs_approval(&name) => {
+                        sink.emit(AgentEvent::ToolApprovalRequired {
+                            turn,
+                            tool: name.clone(),
+                            call_id: id.clone(),
+                            arguments: args.to_string(),
+                        });
+                        a.approve(&name, &id, v).await
+                    }
+                    // Approver present but this tool is auto-approved, or the
+                    // arguments are unparseable (dispatch rejects them below):
+                    // nothing meaningful to approve.
+                    (Some(_), _) | (None, _) => true,
                 };
 
                 // Timed after the approval decision: an interactive approver
@@ -743,6 +766,25 @@ mod tests {
         assert_eq!(out.stop_reason, StopReason::Interrupted);
     }
 
+    #[tokio::test]
+    async fn the_first_turn_can_force_a_tool_call() {
+        let (srv, seq) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"x"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        let mut p = ModelPolicy::single("m");
+        p.initial_tool_choice = "required".into();
+        backend(&srv.uri(), p)
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+
+        let r = seq.requests();
+        assert_eq!(r[0]["tool_choice"], "required", "first turn is forced");
+        assert_eq!(r[1]["tool_choice"], "auto", "later turns are not");
+    }
+
     // ---- tools -------------------------------------------------------------
 
     #[tokio::test]
@@ -830,7 +872,7 @@ mod tests {
     struct DenyAll;
     #[async_trait]
     impl ToolApprover for DenyAll {
-        async fn approve(&self, _: &str, _: &Value) -> bool {
+        async fn approve(&self, _: &str, _: &str, _: &Value) -> bool {
             false
         }
     }
@@ -838,7 +880,7 @@ mod tests {
     struct RecordingApprover(Arc<Mutex<Vec<String>>>);
     #[async_trait]
     impl ToolApprover for RecordingApprover {
-        async fn approve(&self, tool: &str, args: &Value) -> bool {
+        async fn approve(&self, tool: &str, _call_id: &str, args: &Value) -> bool {
             self.0
                 .lock()
                 .unwrap()
@@ -868,6 +910,105 @@ mod tests {
         assert!(
             tool_msg["content"].as_str().unwrap().contains("rejected"),
             "got {tool_msg}"
+        );
+    }
+
+    struct IdRecorder(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl ToolApprover for IdRecorder {
+        async fn approve(&self, _tool: &str, call_id: &str, _args: &Value) -> bool {
+            self.0.lock().unwrap().push(call_id.to_string());
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn the_approver_receives_the_real_call_id() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let (srv, _s) = server(vec![
+            tool_turn(&[("call_abc", "echo", r#"{"text":"x"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        backend(&srv.uri(), ModelPolicy::single("m"))
+            .with_approver(Arc::new(IdRecorder(Arc::clone(&ids))))
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+        assert_eq!(*ids.lock().unwrap(), vec!["call_abc"]);
+    }
+
+    struct GateEcho;
+    #[async_trait]
+    impl ToolApprover for GateEcho {
+        fn needs_approval(&self, tool: &str) -> bool {
+            tool == "echo"
+        }
+        async fn approve(&self, _: &str, _: &str, _: &Value) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_required_is_emitted_only_for_gated_tools() {
+        let (srv, _s) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"x"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        let (sink, mut rx) = EventSink::channel();
+        backend(&srv.uri(), ModelPolicy::single("m"))
+            .with_approver(Arc::new(GateEcho))
+            .run(req(), sink)
+            .await
+            .unwrap();
+
+        let approvals: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                AgentEvent::ToolApprovalRequired { tool, call_id, .. } => Some((tool, call_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(approvals, vec![("echo".to_string(), "c1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_not_needing_approval_emits_no_approval_event() {
+        struct GateNothing;
+        #[async_trait]
+        impl ToolApprover for GateNothing {
+            fn needs_approval(&self, _: &str) -> bool {
+                false
+            }
+            async fn approve(&self, _: &str, _: &str, _: &Value) -> bool {
+                false // would reject if consulted
+            }
+        }
+        let (srv, seq) = server(vec![
+            tool_turn(&[("c1", "echo", r#"{"text":"x"}"#)], 1),
+            text_turn("done", 1),
+        ])
+        .await;
+        let (sink, mut rx) = EventSink::channel();
+        backend(&srv.uri(), ModelPolicy::single("m"))
+            .with_approver(Arc::new(GateNothing))
+            .run(req(), sink)
+            .await
+            .unwrap();
+
+        // Ran (not rejected) and no approval event fired.
+        assert_eq!(
+            seq.requests()[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap()["content"],
+            "echo: x"
+        );
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|e| matches!(e, AgentEvent::ToolApprovalRequired { .. }))
         );
     }
 
@@ -909,7 +1050,7 @@ mod tests {
     struct SlowApprover;
     #[async_trait]
     impl ToolApprover for SlowApprover {
-        async fn approve(&self, _: &str, _: &Value) -> bool {
+        async fn approve(&self, _: &str, _: &str, _: &Value) -> bool {
             tokio::time::sleep(Duration::from_millis(120)).await;
             true
         }
@@ -997,6 +1138,7 @@ mod tests {
                 AgentEvent::TurnStart { .. } => "TurnStart",
                 AgentEvent::TurnResponse { .. } => "TurnResponse",
                 AgentEvent::ContentToken(_) => "ContentToken",
+                AgentEvent::ToolApprovalRequired { .. } => "ToolApprovalRequired",
                 AgentEvent::ToolStart { .. } => "ToolStart",
                 AgentEvent::ToolComplete { .. } => "ToolComplete",
                 AgentEvent::TurnComplete { .. } => "TurnComplete",

@@ -37,6 +37,10 @@ pub struct ModelPolicy {
     /// Per-call output cap sent to the provider. Also bounds the overshoot above.
     pub max_tokens: u32,
     pub temperature: f32,
+    /// `tool_choice` for the first exploration turn only; later turns use
+    /// `"auto"`. Lets a host force a tool call up front ("required") without
+    /// forcing one every turn.
+    pub initial_tool_choice: String,
     /// Cap on characters of tool output carried in the conversation.
     pub max_history_chars: usize,
     /// Whether a failing tool aborts the run or is fed back to the model.
@@ -53,6 +57,7 @@ impl Default for ModelPolicy {
             timeout_secs: Some(300),
             max_tokens: 4_000,
             temperature: 0.2,
+            initial_tool_choice: "auto".to_string(),
             max_history_chars: 45_000,
             continue_on_tool_error: true,
         }

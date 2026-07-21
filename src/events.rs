@@ -42,6 +42,16 @@ pub enum AgentEvent {
     },
     /// A chunk of assistant text.
     ContentToken(String),
+    /// An approver is about to be asked whether a tool may run. Emitted only
+    /// when an approver is set and considers this tool to need approval, so a
+    /// UI can surface a prompt before the (possibly slow) human decision.
+    ToolApprovalRequired {
+        turn: u32,
+        tool: String,
+        call_id: String,
+        /// Raw arguments as the model sent them.
+        arguments: String,
+    },
     /// A tool is about to run.
     ToolStart {
         turn: u32,
