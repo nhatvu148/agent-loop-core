@@ -24,8 +24,11 @@ structs; this crate does not try to be a model abstraction.
 - **The loop** (`ChatBackend`) — a two-phase design: a cheap model drives tool
   calls to gather context, then a strong model answers with tools forbidden.
   Set both models equal for an ordinary single-model loop. Turn cap, token
-  threshold, wall-clock timeout, and interrupt are all honored; a stop on any
-  limit skips the expensive synthesis call.
+  threshold, wall-clock timeout, and interrupt are all honored. Reaching the
+  turn cap still runs the final synthesis pass (the run reports `MaxTurns`, not
+  `Complete`) — you've gathered enough, so produce the answer. A *hard* stop —
+  token budget, timeout, or interrupt — skips synthesis, because it means "stop
+  spending".
 - **Streaming** (`EventSink` / `AgentEvent`) — one event stream drives a live
   UI or, with `EventSink::none()`, nothing at all. `run_structured::<T>()` adds
   a typed ending for callers that want a value rather than a stream.
