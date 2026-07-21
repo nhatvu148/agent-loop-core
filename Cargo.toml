@@ -1,5 +1,5 @@
 [package]
-name = "agent-core"
+name = "agent-loop-core"
 # Own version line, deliberately not `version.workspace` (= vexar's 0.19.0):
 # this is a new public crate and its semver starts from scratch at 0.1.0.
 version = "0.1.0"

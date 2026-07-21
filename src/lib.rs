@@ -12,8 +12,8 @@
 //! owns transport and error semantics, not model abstraction.
 //!
 //! ```no_run
-//! use agent_core::{ChatClient, ProviderConfig};
-//! # async fn f() -> Result<(), agent_core::AgentError> {
+//! use agent_loop_core::{ChatClient, ProviderConfig};
+//! # async fn f() -> Result<(), agent_loop_core::AgentError> {
 //! let client = ChatClient::new(ProviderConfig {
 //!     base_url: "https://openrouter.ai/api/v1".into(),
 //!     api_key: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),

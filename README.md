@@ -1,4 +1,4 @@
-# agent-core
+# agent-loop-core
 
 A hand-rolled LLM agent loop for Rust, extracted from two production consumers
 ([vexar](https://github.com/nhatvu148/vexar), a multi-agent coding cockpit, and
@@ -35,9 +35,9 @@ structs; this crate does not try to be a model abstraction.
 ## Example
 
 ```rust,no_run
-use agent_core::{ChatClient, ProviderConfig};
+use agent_loop_core::{ChatClient, ProviderConfig};
 
-# async fn f() -> Result<(), agent_core::AgentError> {
+# async fn f() -> Result<(), agent_loop_core::AgentError> {
 let client = ChatClient::new(ProviderConfig {
     base_url: "https://openrouter.ai/api/v1".into(),
     api_key: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
@@ -62,4 +62,4 @@ releases.
 
 ## License
 
-MIT (per the workspace).
+MIT — see LICENSE-MIT.
