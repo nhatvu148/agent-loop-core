@@ -1,16 +1,17 @@
 [package]
 name = "agent-core"
-description = "Shared agent-harness primitives: typed errors and a resilient chat-completions client."
-version.workspace = true
+# Own version line, deliberately not `version.workspace` (= vexar's 0.19.0):
+# this is a new public crate and its semver starts from scratch at 0.1.0.
+version = "0.1.0"
+description = "A hand-rolled LLM agent loop: resilient chat transport, typed tools with derived schemas, a streaming event sink, and a two-model cost split. Provider-agnostic over any OpenAI-compatible endpoint."
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-# Not published yet. See the step 6 decision: publish as a support crate (which
-# pr-review-core needs in order to resume crates.io releases), or keep it
-# internal permanently.
-publish = false
+readme = "README.md"
+keywords = ["agent", "llm", "tool-calling", "openai", "ai"]
+categories = ["asynchronous", "api-bindings"]
 
 [dependencies]
 reqwest = { workspace = true }
