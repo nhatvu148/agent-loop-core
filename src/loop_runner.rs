@@ -469,10 +469,15 @@ impl Backend for ChatBackend {
         }
 
         // ---- phase 2: synthesis on the strong model, tools forbidden ----
+        // "in the exact format the system prompt requested" reinforces whatever
+        // output contract the caller defined — e.g. a structured-output consumer
+        // that demanded JSON in its system prompt gets that demand repeated at
+        // the decisive moment, without this crate hardcoding any one format.
         messages.push(json!({
             "role": "user",
             "content": "Stop investigating now. Using only what you've already gathered, \
-                        produce the final answer — no prose preamble, no tool calls.",
+                        produce the final answer in the exact format the system prompt \
+                        requested — no prose preamble, no markdown fences, no tool calls.",
         }));
         trim_history(&mut messages, self.policy.max_history_chars);
 

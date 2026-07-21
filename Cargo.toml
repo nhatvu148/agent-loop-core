@@ -12,7 +12,7 @@ keywords = ["agent", "llm", "tool-calling", "openai", "ai"]
 categories = ["asynchronous", "api-bindings"]
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
