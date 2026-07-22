@@ -649,6 +649,41 @@ mod tests {
     }
 
     #[test]
+    fn several_tool_calls_in_one_turn_all_survive_in_order() {
+        // Only reachable when `parallel_tool_calls` is not disabled — jpt-copilot
+        // disables it, but nothing else does, and a dropped or reordered call
+        // would strand a tool result against a call_id the model never sent.
+        let resp = json!({
+            "output": [
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "checking both"}]},
+                {"type": "function_call", "call_id": "c2", "name": "b", "arguments": "{\"x\":1}"}
+            ],
+            "usage": {"total_tokens": 9}
+        });
+        let (message, _) = Responses::new().parse_response(&resp).unwrap();
+
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2, "both calls must survive");
+        assert_eq!(calls[0]["id"], "c1");
+        assert_eq!(calls[1]["id"], "c2");
+        assert_eq!(calls[1]["function"]["arguments"], "{\"x\":1}");
+        // Text interleaved between calls still lands on the message.
+        assert_eq!(message["content"], "checking both");
+
+        // And the whole turn re-encodes: two calls, then their two results.
+        let transcript = vec![
+            message,
+            json!({"role": "tool", "tool_call_id": "c1", "content": "ra"}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "rb"}),
+        ];
+        let input = Responses::to_input(&transcript);
+        let ids: Vec<_> = input.iter().filter_map(|i| i["call_id"].as_str()).collect();
+        assert_eq!(ids, vec!["c1", "c2", "c1", "c2"], "calls then results, paired");
+    }
+
+    #[test]
     fn a_text_only_response_has_no_tool_calls_key() {
         // The loop breaks the exploration loop on an empty tool_calls array, so
         // an absent key and an empty array must not be confused.
