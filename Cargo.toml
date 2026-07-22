@@ -1,6 +1,6 @@
 [package]
 name = "agent-loop-core"
-version = "0.2.0"
+version = "0.1.2"
 description = "A hand-rolled LLM agent loop: resilient chat transport, typed tools with derived schemas, a streaming event sink, and a two-model cost split. Provider-agnostic over any OpenAI-compatible endpoint."
 edition = "2024"
 rust-version = "1.88.0"

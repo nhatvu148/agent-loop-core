@@ -47,16 +47,16 @@ fn main() {
 
     let mut policy = ModelPolicy::single("gpt-5.6-luna");
     policy.max_tokens = 200;
-    policy
-        .extra_body
-        .insert("parallel_tool_calls".into(), json!(false));
+    let mut extra = serde_json::Map::new();
+    extra.insert("parallel_tool_calls".into(), json!(false));
 
     let body = Responses::new().build_request(WireRequest {
-        model: &policy.explore.clone(),
+        model: "gpt-5.6-luna",
         messages: &messages,
         tools: &tools,
         tool_choice: "auto",
         policy: &policy,
+        extra_body: &extra,
     });
 
     println!("{}", serde_json::to_string_pretty(&body).unwrap());

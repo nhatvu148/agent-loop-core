@@ -38,6 +38,9 @@ pub struct WireRequest<'a> {
     pub tools: &'a [Value],
     pub tool_choice: &'a str,
     pub policy: &'a ModelPolicy,
+    /// Extra top-level body fields, applied last. See
+    /// [`crate::ChatBackend::with_extra_body`].
+    pub extra_body: &'a Map<String, Value>,
 }
 
 /// Encodes a turn for one endpoint schema and decodes its reply.
@@ -73,7 +76,7 @@ fn apply_extra(body: &mut Value, extra: &Map<String, Value>) -> Vec<String> {
                 overridden.push(k.clone());
                 tracing::warn!(
                     key = %k,
-                    "ModelPolicy::extra_body overrides a field the wire format set"
+                    "extra_body overrides a field the wire format set"
                 );
             }
             obj.insert(k.clone(), v.clone());
@@ -128,7 +131,7 @@ impl WireFormat for ChatCompletions {
             body["tools"] = json!(req.tools);
             body["tool_choice"] = json!(req.tool_choice);
         }
-        let _ = apply_extra(&mut body, &req.policy.extra_body);
+        let _ = apply_extra(&mut body, req.extra_body);
         body
     }
 
@@ -348,7 +351,7 @@ impl WireFormat for Responses {
             body["tools"] = json!(Self::to_tools(req.tools));
             body["tool_choice"] = json!(req.tool_choice);
         }
-        let _ = apply_extra(&mut body, &req.policy.extra_body);
+        let _ = apply_extra(&mut body, req.extra_body);
         body
     }
 
@@ -447,6 +450,7 @@ mod tests {
             tools: &tools,
             tool_choice: "auto",
             policy: &p,
+            extra_body: &Map::new(),
         });
         assert_eq!(body["model"], "m");
         assert_eq!(body["messages"], json!(msgs), "transcript passes through");
@@ -466,6 +470,7 @@ mod tests {
             tools: &[],
             tool_choice: "auto",
             policy: &p,
+            extra_body: &Map::new(),
         });
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
@@ -485,6 +490,7 @@ mod tests {
             tools: &tools,
             tool_choice: "auto",
             policy: &p,
+            extra_body: &Map::new(),
         });
         let t = &body["tools"][0];
         assert_eq!(t["type"], "function");
@@ -503,6 +509,7 @@ mod tests {
             tools: &[],
             tool_choice: "auto",
             policy: &p,
+            extra_body: &Map::new(),
         });
         let input = body["input"].as_array().unwrap();
 
@@ -550,6 +557,7 @@ mod tests {
             tools: &[],
             tool_choice: "auto",
             policy: &p,
+            extra_body: &Map::new(),
         });
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2, "one message item + one function_call item");
@@ -566,6 +574,7 @@ mod tests {
             tools: &[],
             tool_choice: "auto",
             policy: &p,
+            extra_body: &Map::new(),
         };
         assert!(Responses::new().build_request(req).get("temperature").is_none());
         assert_eq!(
@@ -592,18 +601,19 @@ mod tests {
 
     #[test]
     fn extra_body_reaches_both_formats() {
-        // The reason this field exists: jpt-copilot needs
+        // The reason this escape hatch exists: jpt-copilot needs
         // parallel_tool_calls=false or the model emits a mesh call before it has
         // seen the Part ID the previous call returned.
-        let mut p = policy();
-        p.extra_body
-            .insert("parallel_tool_calls".into(), json!(false));
+        let p = policy();
+        let mut extra = Map::new();
+        extra.insert("parallel_tool_calls".into(), json!(false));
         let req = WireRequest {
             model: "m",
             messages: &[],
             tools: &[],
             tool_choice: "auto",
             policy: &p,
+            extra_body: &extra,
         };
         assert_eq!(ChatCompletions.build_request(req)["parallel_tool_calls"], false);
         assert_eq!(Responses::new().build_request(req)["parallel_tool_calls"], false);
@@ -798,9 +808,8 @@ mod live_wire_fixture {
         })];
         let mut policy = ModelPolicy::single("gpt-5.6-luna");
         policy.max_tokens = 200;
-        policy
-            .extra_body
-            .insert("parallel_tool_calls".into(), json!(false));
+        let mut extra = Map::new();
+        extra.insert("parallel_tool_calls".into(), json!(false));
 
         Responses::new().build_request(WireRequest {
             model: "gpt-5.6-luna",
@@ -808,6 +817,7 @@ mod live_wire_fixture {
             tools: &tools,
             tool_choice: "auto",
             policy: &policy,
+            extra_body: &extra,
         })
     }
 

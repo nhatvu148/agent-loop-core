@@ -55,6 +55,7 @@ pub struct ChatBackend {
     interrupt: Arc<AtomicBool>,
     approver: Option<Arc<dyn ToolApprover>>,
     wire: Arc<dyn WireFormat>,
+    extra_body: serde_json::Map<String, Value>,
 }
 
 impl ChatBackend {
@@ -75,7 +76,30 @@ impl ChatBackend {
             interrupt: Arc::new(AtomicBool::new(false)),
             approver: None,
             wire: Arc::new(ChatCompletions),
+            extra_body: serde_json::Map::new(),
         }
+    }
+
+    /// Extra top-level fields merged into every request body, applied last so
+    /// they win over anything the wire format chose.
+    ///
+    /// The escape hatch for provider parameters this crate does not model.
+    /// jpt-copilot needs `parallel_tool_calls: false` — without it the model
+    /// emits a dependent PSJ call in the same turn as the call whose returned
+    /// ID it needs, which is a real ordering bug, not a preference.
+    ///
+    /// This lives here rather than on [`ModelPolicy`] on purpose. `ModelPolicy`
+    /// has public fields and no `#[non_exhaustive]`, and downstream constructs
+    /// it exhaustively — so a field added there is a compile break for every
+    /// caller, including ones with no use for it. A builder method costs them
+    /// nothing.
+    ///
+    /// Overriding a key the wire format itself set (`model`, `messages` /
+    /// `input`, `tools`) is almost always a mistake and is logged at `warn`.
+    #[must_use]
+    pub fn with_extra_body(mut self, extra: serde_json::Map<String, Value>) -> Self {
+        self.extra_body = extra;
+        self
     }
 
     /// Talk a different endpoint schema.
@@ -135,6 +159,7 @@ impl ChatBackend {
             tools,
             tool_choice,
             policy: &self.policy,
+            extra_body: &self.extra_body,
         });
         let data = self.chat.post(self.wire.path(), &body).await?;
         self.wire.parse_response(&data)
@@ -1622,13 +1647,13 @@ mod tests {
             .mount(&srv)
             .await;
 
-        let mut policy = ModelPolicy::single("gpt-5.6-luna");
-        policy
-            .extra_body
-            .insert("parallel_tool_calls".into(), json!(false));
+        let policy = ModelPolicy::single("gpt-5.6-luna");
+        let mut extra = serde_json::Map::new();
+        extra.insert("parallel_tool_calls".into(), json!(false));
 
         let out = backend(&srv.uri(), policy)
             .with_wire_format(Arc::new(crate::wire::Responses::new()))
+            .with_extra_body(extra)
             .run(req(), EventSink::none())
             .await
             .unwrap();

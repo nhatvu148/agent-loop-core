@@ -129,11 +129,12 @@ Talking to a model that needs OpenAI's typed-item endpoint instead:
 use agent_loop_core::{ChatBackend, ModelPolicy, Responses};
 use std::sync::Arc;
 
-let mut policy = ModelPolicy::single("gpt-5.6-luna");
-policy.extra_body.insert("parallel_tool_calls".into(), false.into());
+let mut extra = serde_json::Map::new();
+extra.insert("parallel_tool_calls".into(), false.into());
 
-let backend = ChatBackend::new(chat, tools, policy)
-    .with_wire_format(Arc::new(Responses::new()));
+let backend = ChatBackend::new(chat, tools, ModelPolicy::single("gpt-5.6-luna"))
+    .with_wire_format(Arc::new(Responses::new()))
+    .with_extra_body(extra);
 ```
 
 ## What's in it
@@ -150,7 +151,7 @@ let backend = ChatBackend::new(chat, tools, policy)
   `Responses` when a model requires it — OpenAI's `gpt-5.6` family returns 400
   for function tools on `chat/completions` unless reasoning is disabled, and
   disabling reasoning ships a different model than the one you benchmarked.
-  Anything the crate doesn't model goes in `ModelPolicy::extra_body`.
+  Anything the crate doesn't model goes in `ChatBackend::with_extra_body`.
 - **`ChatBackend`** — the two-phase loop. Turn cap, token threshold, wall-clock
   timeout, and interrupt are all honored. Reaching the turn cap still runs the
   final synthesis pass (the run reports `MaxTurns`, not `Complete`) — you've
