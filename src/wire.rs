@@ -184,6 +184,26 @@ fn tool_output_text(content: &Value) -> String {
     }
 }
 
+/// A tool call's `arguments`, which both schemas carry as a JSON **string**.
+///
+/// Same rule as [`tool_output_text`], and it was missed here first time round:
+/// `as_str().unwrap_or("{}")` turns arguments that arrive as an object into a
+/// zero-argument call. That is the worst possible failure — the tool runs, with
+/// nothing, and looks like it succeeded. Absent arguments legitimately mean
+/// `{}` (models omit the field for zero-argument tools); anything else is
+/// serialised so the call keeps its parameters.
+fn tool_arguments_text(arguments: &Value) -> String {
+    match arguments {
+        Value::String(s) if s.trim().is_empty() => "{}".to_string(),
+        Value::String(s) => s.clone(),
+        Value::Null => "{}".to_string(),
+        other => {
+            tracing::warn!("tool arguments were not a JSON string; serialising");
+            other.to_string()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------
@@ -249,7 +269,7 @@ impl Responses {
                     // own `id` is a different identifier and is not echoed back.
                     "call_id": call["id"].as_str().unwrap_or_default(),
                     "name": call["function"]["name"].as_str().unwrap_or_default(),
-                    "arguments": call["function"]["arguments"].as_str().unwrap_or("{}"),
+                    "arguments": tool_arguments_text(&call["function"]["arguments"]),
                 }));
             }
         }
@@ -319,7 +339,7 @@ impl WireFormat for Responses {
                     "type": "function",
                     "function": {
                         "name": item["name"].as_str().unwrap_or_default(),
-                        "arguments": item["arguments"].as_str().unwrap_or("{}"),
+                        "arguments": tool_arguments_text(&item["arguments"]),
                     }
                 })),
                 // `reasoning` items and anything else the API grows are ignored
@@ -655,6 +675,97 @@ mod tests {
 }
 
 #[cfg(test)]
+mod live_wire_fixture {
+    //! Captured verbatim from `POST https://api.openai.com/v1/responses`
+    //! against `gpt-5.6-luna` on 2026-07-22. Every other Responses test uses a
+    //! shape *I* wrote, which proves only that the parser matches my
+    //! assumptions. This one proves it matches OpenAI.
+    //!
+    //! Fields the parser ignores are kept in the fixture on purpose: an
+    //! unfamiliar member must never be what breaks a run.
+
+    use super::*;
+    use serde_json::json;
+
+    fn captured() -> Value {
+        json!({
+            "id": "resp_0ab8a5408228d628006a6011d467b0819b8b32cba0a7b906a2",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.6-luna",
+            "max_output_tokens": 200,
+            "parallel_tool_calls": false,
+            "temperature": 1.0,
+            "reasoning": {"context": "all_turns", "effort": "medium", "mode": "standard"},
+            "output": [{
+                "id": "fc_0ab8a5408228d628006a6011d53e48819bbe7d6f0ea2edbdb1",
+                "type": "function_call",
+                "status": "completed",
+                "arguments": "{\"city\":\"Paris\"}",
+                "call_id": "call_7Jl0dn2CmiDLVR7jXDb7Y6I9",
+                "name": "get_weather"
+            }],
+            "usage": {
+                "input_tokens": 128,
+                "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+                "output_tokens": 18,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 146
+            }
+        })
+    }
+
+    #[test]
+    fn the_real_response_parses_into_a_canonical_tool_call() {
+        let (message, tokens) = Responses::new().parse_response(&captured()).unwrap();
+
+        assert_eq!(tokens, 146);
+        assert_eq!(message["role"], "assistant");
+        assert!(message["content"].is_null(), "a tool-only turn has no text");
+
+        // The id the loop must echo back is `call_id`, not the item's own `id`
+        // — the fixture has both, and they differ, so this discriminates.
+        assert_eq!(
+            message["tool_calls"][0]["id"], "call_7Jl0dn2CmiDLVR7jXDb7Y6I9",
+            "must correlate on call_id, not the fc_… item id"
+        );
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+    }
+
+    #[test]
+    fn the_real_usage_block_is_read_despite_its_nested_details() {
+        // `input_tokens_details` / `output_tokens_details` are objects sitting
+        // beside the scalars. Reading usage must not trip over them.
+        assert_eq!(total_tokens(&captured()), 146);
+    }
+
+    #[test]
+    fn the_captured_turn_round_trips_back_into_a_request() {
+        // End to end on real data: parse the live reply, answer the tool, and
+        // confirm the next request carries the same call_id on both items.
+        let (message, _) = Responses::new().parse_response(&captured()).unwrap();
+        let transcript = vec![
+            message,
+            json!({"role": "tool",
+                   "tool_call_id": "call_7Jl0dn2CmiDLVR7jXDb7Y6I9",
+                   "content": "18C and raining"}),
+        ];
+        let input = Responses::to_input(&transcript);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_7Jl0dn2CmiDLVR7jXDb7Y6I9");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_7Jl0dn2CmiDLVR7jXDb7Y6I9");
+        assert_eq!(input[1]["output"], "18C and raining");
+    }
+}
+
+#[cfg(test)]
 mod no_silent_loss {
     //! Regression tests for a defect this module shipped with and did not
     //! catch: every other test used plain-string content, so translation could
@@ -687,6 +798,40 @@ mod no_silent_loss {
         let input = Responses::to_input(&msgs);
         assert_eq!(input.len(), 1);
         assert!(input[0]["content"].is_array());
+    }
+
+    #[test]
+    fn structured_tool_arguments_are_serialised_not_reduced_to_no_args() {
+        // The worst shape of this bug: the tool would run with no parameters
+        // and report success. Raised in review on the first cut of this PR.
+        let msgs = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "grep", "arguments": {"pattern": "fn main"}}}]
+        })];
+        let input = Responses::to_input(&msgs);
+        assert_eq!(input[0]["arguments"], r#"{"pattern":"fn main"}"#);
+
+        // Absent arguments legitimately mean "{}" — models omit the field for
+        // zero-argument tools, so this must not become a warning-worthy case.
+        let msgs = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "ping"}}]
+        })];
+        assert_eq!(Responses::to_input(&msgs)[0]["arguments"], "{}");
+    }
+
+    #[test]
+    fn structured_arguments_survive_parsing_too() {
+        let resp = json!({
+            "output": [{"type": "function_call", "call_id": "c1", "name": "grep",
+                        "arguments": {"pattern": "fn main"}}]
+        });
+        let (message, _) = Responses::new().parse_response(&resp).unwrap();
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"pattern":"fn main"}"#
+        );
     }
 
     #[test]

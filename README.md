@@ -126,7 +126,7 @@ endpoint.
 Talking to a model that needs OpenAI's typed-item endpoint instead:
 
 ```rust,ignore
-use agent_loop_core::{Responses, ModelPolicy};
+use agent_loop_core::{ChatBackend, ModelPolicy, Responses};
 use std::sync::Arc;
 
 let mut policy = ModelPolicy::single("gpt-5.6-luna");
