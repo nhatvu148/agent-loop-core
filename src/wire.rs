@@ -212,6 +212,23 @@ fn tool_arguments_text(arguments: &Value) -> String {
 ///
 /// Reasoning models reject `temperature`, so it is omitted by default. Call
 /// [`Responses::with_temperature`] for a non-reasoning model on this endpoint.
+///
+/// # Provider support
+///
+/// This endpoint is **not** part of the OpenAI-compatible surface most
+/// providers implement — [`ChatCompletions`] remains the portable default and
+/// the right choice unless a model specifically requires otherwise.
+///
+/// | Provider | `/responses` | How established |
+/// |---|---|---|
+/// | OpenAI | yes | live call, 2026-07-22 (see `live_wire_fixture`) |
+/// | OpenRouter | yes | published OpenAPI spec: `FunctionTool` is flat, `OpenAIResponseFunctionToolCall` and usage keys match OpenAI. Not live-tested. |
+/// | Moonshot | no | `404` — no such route |
+/// | Ollama, LiteLLM, Z.ai, … | assume no | unverified; use [`ChatCompletions`] |
+///
+/// Azure OpenAI needs an `?api-version=` query parameter that
+/// [`crate::ChatClient`] cannot express in a path — a pre-existing limitation
+/// of the transport, not of this format, and it affects both formats equally.
 #[derive(Debug, Clone, Copy)]
 pub struct Responses {
     send_temperature: bool,
