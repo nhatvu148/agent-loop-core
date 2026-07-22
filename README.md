@@ -129,12 +129,9 @@ Talking to a model that needs OpenAI's typed-item endpoint instead:
 use agent_loop_core::{ChatBackend, ModelPolicy, Responses};
 use std::sync::Arc;
 
-let mut extra = serde_json::Map::new();
-extra.insert("parallel_tool_calls".into(), false.into());
-
 let backend = ChatBackend::new(chat, tools, ModelPolicy::single("gpt-5.6-luna"))
     .with_wire_format(Arc::new(Responses::new()))
-    .with_extra_body(extra);
+    .with_extra_field("parallel_tool_calls", false);
 ```
 
 ## What's in it

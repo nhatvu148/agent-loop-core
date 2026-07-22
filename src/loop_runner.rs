@@ -102,6 +102,27 @@ impl ChatBackend {
         self
     }
 
+    /// Set one extra body field, without building a map for it.
+    ///
+    /// The common case is a single provider flag, and
+    /// [`ChatBackend::with_extra_body`] costs two lines and a `serde_json::Map`
+    /// import to express that. Chainable, so several flags read as several
+    /// calls.
+    ///
+    /// ```no_run
+    /// # use agent_loop_core::{ChatBackend, ChatClient, ModelPolicy, ToolRegistry};
+    /// # use std::sync::Arc;
+    /// # fn f(chat: ChatClient, tools: Arc<ToolRegistry>) {
+    /// let backend = ChatBackend::new(chat, tools, ModelPolicy::single("gpt-5.6-luna"))
+    ///     .with_extra_field("parallel_tool_calls", false);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_extra_field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra_body.insert(key.into(), value.into());
+        self
+    }
+
     /// Talk a different endpoint schema.
     ///
     /// Defaults to [`ChatCompletions`]. Use [`crate::wire::Responses`] for
@@ -1647,13 +1668,9 @@ mod tests {
             .mount(&srv)
             .await;
 
-        let policy = ModelPolicy::single("gpt-5.6-luna");
-        let mut extra = serde_json::Map::new();
-        extra.insert("parallel_tool_calls".into(), json!(false));
-
-        let out = backend(&srv.uri(), policy)
+        let out = backend(&srv.uri(), ModelPolicy::single("gpt-5.6-luna"))
             .with_wire_format(Arc::new(crate::wire::Responses::new()))
-            .with_extra_body(extra)
+            .with_extra_field("parallel_tool_calls", false)
             .run(req(), EventSink::none())
             .await
             .unwrap();
