@@ -58,12 +58,28 @@ pub trait WireFormat: Send + Sync + std::fmt::Debug {
 
 /// Merge caller-supplied body fields. Applied last, so a caller can override
 /// anything the format chose — including `model` or `tools` — deliberately.
-fn apply_extra(body: &mut Value, extra: &Map<String, Value>) {
+///
+/// Overriding a structural key (`model`, `messages`/`input`, `tools`) is almost
+/// always a mistake rather than an intention: it can silently detach the
+/// request from the transcript the loop is maintaining. The override still
+/// happens — a caller who means it needs the escape hatch — but it warns, and
+/// the overridden keys are returned so tests can assert on them without
+/// scraping log output.
+fn apply_extra(body: &mut Value, extra: &Map<String, Value>) -> Vec<String> {
+    let mut overridden = Vec::new();
     if let Some(obj) = body.as_object_mut() {
         for (k, v) in extra {
+            if obj.contains_key(k) {
+                overridden.push(k.clone());
+                tracing::warn!(
+                    key = %k,
+                    "ModelPolicy::extra_body overrides a field the wire format set"
+                );
+            }
             obj.insert(k.clone(), v.clone());
         }
     }
+    overridden
 }
 
 /// Token usage, read tolerantly.
@@ -112,7 +128,7 @@ impl WireFormat for ChatCompletions {
             body["tools"] = json!(req.tools);
             body["tool_choice"] = json!(req.tool_choice);
         }
-        apply_extra(&mut body, &req.policy.extra_body);
+        let _ = apply_extra(&mut body, &req.policy.extra_body);
         body
     }
 
@@ -221,10 +237,14 @@ fn tool_arguments_text(arguments: &Value) -> String {
 ///
 /// | Provider | `/responses` | How established |
 /// |---|---|---|
-/// | OpenAI | yes | live call, 2026-07-22 (see `live_wire_fixture`) |
-/// | OpenRouter | yes | published OpenAPI spec: `FunctionTool` is flat, `OpenAIResponseFunctionToolCall` and usage keys match OpenAI. Not live-tested. |
+/// | OpenAI | yes | live, 2026-07-22 — full multi-turn request accepted, tool result honoured |
+/// | OpenRouter | yes | live, 2026-07-22 — same generated body accepted for `openai/gpt-4o-mini` and `openai/gpt-5.6-luna`; identical item and usage shapes (plus `cost`/`is_byok`) |
 /// | Moonshot | no | `404` — no such route |
 /// | Ollama, LiteLLM, Z.ai, … | assume no | unverified; use [`ChatCompletions`] |
+///
+/// Both live checks sent the body produced by
+/// `examples/dump_responses_request.rs`, so the *request* side is verified by
+/// the same code path callers use — not by a hand-written payload.
 ///
 /// Azure OpenAI needs an `?api-version=` query parameter that
 /// [`crate::ChatClient`] cannot express in a path — a pre-existing limitation
@@ -328,7 +348,7 @@ impl WireFormat for Responses {
             body["tools"] = json!(Self::to_tools(req.tools));
             body["tool_choice"] = json!(req.tool_choice);
         }
-        apply_extra(&mut body, &req.policy.extra_body);
+        let _ = apply_extra(&mut body, &req.policy.extra_body);
         body
     }
 
@@ -555,6 +575,22 @@ mod tests {
     }
 
     #[test]
+    fn overriding_a_structural_key_via_extra_body_is_reported() {
+        // Raised in review: extra_body is applied last and can silently detach
+        // the request from the transcript the loop maintains. The override
+        // still happens — it is an escape hatch — but it is no longer silent.
+        let mut body = json!({"model": "m", "input": [], "tools": []});
+        let mut extra = Map::new();
+        extra.insert("model".into(), json!("something-else"));
+        extra.insert("reasoning_effort".into(), json!("high"));
+
+        let overridden = apply_extra(&mut body, &extra);
+        assert_eq!(overridden, vec!["model".to_string()], "only collisions");
+        assert_eq!(body["model"], "something-else", "the override still applies");
+        assert_eq!(body["reasoning_effort"], "high", "additions are not collisions");
+    }
+
+    #[test]
     fn extra_body_reaches_both_formats() {
         // The reason this field exists: jpt-copilot needs
         // parallel_tool_calls=false or the model emits a mesh call before it has
@@ -730,6 +766,141 @@ mod live_wire_fixture {
                 "total_tokens": 146
             }
         })
+    }
+
+    /// The *request* this crate generates for a full multi-turn transcript,
+    /// captured from `examples/dump_responses_request.rs` and sent verbatim to
+    /// both providers on 2026-07-22. Both accepted it and answered from the
+    /// tool result ("Paris: 18°C and raining"), which is what proves the model
+    /// actually read our `function_call_output` rather than ignoring it.
+    ///
+    /// Fixtures alone could not establish this: they only ever proved the
+    /// parser matches a reply. Nothing proved the API accepts what we *send*.
+    fn generated_request() -> Value {
+        let messages = vec![
+            json!({"role": "system", "content": "You are a terse assistant."}),
+            json!({"role": "user", "content": "What is the weather in Paris?"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_seed_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+            }]}),
+            json!({"role": "tool", "tool_call_id": "call_seed_1", "content": "18C, raining"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather for a city.",
+                "parameters": {"type": "object",
+                               "properties": {"city": {"type": "string"}},
+                               "required": ["city"]}
+            }
+        })];
+        let mut policy = ModelPolicy::single("gpt-5.6-luna");
+        policy.max_tokens = 200;
+        policy
+            .extra_body
+            .insert("parallel_tool_calls".into(), json!(false));
+
+        Responses::new().build_request(WireRequest {
+            model: "gpt-5.6-luna",
+            messages: &messages,
+            tools: &tools,
+            tool_choice: "auto",
+            policy: &policy,
+        })
+    }
+
+    #[test]
+    fn the_request_accepted_by_both_providers_is_still_what_we_generate() {
+        // Pins the exact bytes both APIs accepted. If translation drifts, this
+        // fails here rather than as a 400 in production.
+        let body = generated_request();
+        let input = body["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0], json!({"role": "system", "content": "You are a terse assistant."}));
+        assert_eq!(input[1], json!({"role": "user", "content": "What is the weather in Paris?"}));
+        assert_eq!(
+            input[2],
+            json!({"type": "function_call", "call_id": "call_seed_1",
+                   "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"})
+        );
+        assert_eq!(
+            input[3],
+            json!({"type": "function_call_output", "call_id": "call_seed_1",
+                   "output": "18C, raining"})
+        );
+        assert_eq!(body["max_output_tokens"], 200);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("messages").is_none());
+    }
+
+    /// The text reply to that request, captured verbatim from OpenAI. Carries
+    /// members the parser ignores (`phase`, `annotations`, `logprobs`,
+    /// `status`) on purpose.
+    #[test]
+    fn the_real_text_reply_parses() {
+        let resp = json!({
+            "output": [{
+                "id": "msg_00012b2ba28d1ae6006a60189ab9d081988f899c7066f93f58",
+                "type": "message",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "annotations": [],
+                    "logprobs": [],
+                    "text": "Paris: 18°C and raining."
+                }],
+                "phase": "final_answer",
+                "role": "assistant"
+            }],
+            "usage": {
+                "input_tokens": 171,
+                "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+                "output_tokens": 12,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 183
+            }
+        });
+        let (message, tokens) = Responses::new().parse_response(&resp).unwrap();
+        assert_eq!(tokens, 183);
+        assert_eq!(message["content"], "Paris: 18°C and raining.");
+        assert!(message.get("tool_calls").is_none());
+    }
+
+    /// OpenRouter's `function_call`, captured live from
+    /// `openrouter.ai/api/v1/responses` with `openai/gpt-5.6-luna`.
+    ///
+    /// Same shape as OpenAI's, and it independently confirms the `id` /
+    /// `call_id` distinction: `fc_tmp_…` versus `call_…`. Correlating on `id`
+    /// would orphan every tool result.
+    #[test]
+    fn openrouters_tool_call_parses_identically() {
+        let resp = json!({
+            "output": [{
+                "arguments": "{\"city\":\"Paris\"}",
+                "call_id": "call_TuPiRQcCzLkaVq0v5BlUZSmp",
+                "id": "fc_tmp_iadnucwi7ps",
+                "name": "get_weather",
+                "status": "completed",
+                "type": "function_call"
+            }],
+            // OpenRouter adds `cost` / `is_byok` beside the standard counts.
+            "usage": {
+                "cost": 0.000123, "is_byok": false,
+                "input_tokens": 171, "output_tokens": 12, "total_tokens": 183
+            }
+        });
+        let (message, tokens) = Responses::new().parse_response(&resp).unwrap();
+        assert_eq!(tokens, 183, "provider-specific usage keys must not confuse it");
+        assert_eq!(
+            message["tool_calls"][0]["id"], "call_TuPiRQcCzLkaVq0v5BlUZSmp",
+            "correlate on call_id — `id` here is fc_tmp_… and would orphan the result"
+        );
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
     }
 
     #[test]
