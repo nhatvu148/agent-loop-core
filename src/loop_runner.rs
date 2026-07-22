@@ -21,6 +21,7 @@ use crate::error::AgentError;
 use crate::events::{AgentEvent, EventSink, StopReason};
 use crate::provider::ChatClient;
 use crate::tools::ToolRegistry;
+use crate::wire::{ChatCompletions, WireFormat, WireRequest};
 
 /// Decides whether a tool call may run.
 ///
@@ -53,6 +54,7 @@ pub struct ChatBackend {
     policy: ModelPolicy,
     interrupt: Arc<AtomicBool>,
     approver: Option<Arc<dyn ToolApprover>>,
+    wire: Arc<dyn WireFormat>,
 }
 
 impl ChatBackend {
@@ -72,7 +74,19 @@ impl ChatBackend {
             policy,
             interrupt: Arc::new(AtomicBool::new(false)),
             approver: None,
+            wire: Arc::new(ChatCompletions),
         }
+    }
+
+    /// Talk a different endpoint schema.
+    ///
+    /// Defaults to [`ChatCompletions`]. Use [`crate::wire::Responses`] for
+    /// OpenAI's `gpt-5.6` family, which returns 400 for function tools on
+    /// chat/completions unless reasoning is switched off.
+    #[must_use]
+    pub fn with_wire_format(mut self, wire: Arc<dyn WireFormat>) -> Self {
+        self.wire = wire;
+        self
     }
 
     /// Gate tool execution behind an approver.
@@ -115,27 +129,15 @@ impl ChatBackend {
         tools: &[Value],
         tool_choice: &str,
     ) -> Result<(Value, u32), AgentError> {
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "max_tokens": self.policy.max_tokens,
-            "temperature": self.policy.temperature,
+        let body = self.wire.build_request(WireRequest {
+            model,
+            messages,
+            tools,
+            tool_choice,
+            policy: &self.policy,
         });
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-            body["tool_choice"] = json!(tool_choice);
-        }
-
-        let data = self.chat.post_chat(&body).await?;
-        let tokens = data
-            .pointer("/usage/total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        let message = data
-            .pointer("/choices/0/message")
-            .cloned()
-            .ok_or_else(|| AgentError::Decode("response had no choices[0].message".into()))?;
-        Ok((message, tokens))
+        let data = self.chat.post(self.wire.path(), &body).await?;
+        self.wire.parse_response(&data)
     }
 }
 
@@ -1580,5 +1582,114 @@ mod tests {
             "[earlier tool result elided to save context]"
         );
         assert_eq!(msgs[3]["content"], "newest");
+    }
+
+    // ---- the wire-format seam ---------------------------------------------
+
+    /// Responses-shaped replies, mirroring `tool_turn` / `text_turn`.
+    fn responses_tool_turn(call_id: &str, name: &str, args: &str, tokens: u32) -> Value {
+        json!({
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "function_call", "id": "fc_1", "call_id": call_id,
+                 "name": name, "arguments": args}
+            ],
+            "usage": {"input_tokens": tokens, "output_tokens": 0}
+        })
+    }
+
+    fn responses_text_turn(content: &str, tokens: u32) -> Value {
+        json!({
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}]}],
+            "usage": {"input_tokens": tokens, "output_tokens": 0}
+        })
+    }
+
+    #[tokio::test]
+    async fn the_loop_drives_a_full_tool_round_trip_over_the_responses_schema() {
+        // The seam's real contract: swapping the wire format changes the path,
+        // the request schema and the response schema — and nothing else. The
+        // loop, the tools and the resulting transcript are identical.
+        let srv = MockServer::start().await;
+        let seq = Seq::new(vec![
+            responses_tool_turn("call_1", "echo", r#"{"text":"hi"}"#, 10),
+            responses_text_turn("all done", 20),
+        ]);
+        Mock::given(method("POST"))
+            .and(pathm("/responses"))
+            .respond_with(seq.clone())
+            .mount(&srv)
+            .await;
+
+        let mut policy = ModelPolicy::single("gpt-5.6-luna");
+        policy
+            .extra_body
+            .insert("parallel_tool_calls".into(), json!(false));
+
+        let out = backend(&srv.uri(), policy)
+            .with_wire_format(Arc::new(crate::wire::Responses::new()))
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+
+        assert_eq!(out.stop_reason, StopReason::Complete);
+        assert_eq!(out.content.as_deref(), Some("all done"));
+        assert_eq!(out.total_tokens, 30, "usage summed from input/output_tokens");
+        assert_eq!(seq.calls(), 2);
+
+        let reqs = seq.requests();
+
+        // Turn 1: Responses schema, flat tools, no `messages`, no temperature.
+        assert!(reqs[0].get("messages").is_none());
+        assert_eq!(reqs[0]["input"][0]["role"], "system");
+        assert_eq!(reqs[0]["input"][1]["content"], "USER");
+        // Definitions come back sorted by name, so index 0 is `boom`.
+        let tools = reqs[0]["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.iter().map(|t| &t["name"]).collect::<Vec<_>>(),
+            vec!["boom", "echo"]
+        );
+        assert!(
+            tools.iter().all(|t| t.get("function").is_none()),
+            "Responses tool defs are flat, not nested under `function`"
+        );
+        assert_eq!(reqs[0]["max_output_tokens"], 4_000);
+        assert!(reqs[0].get("temperature").is_none());
+        assert_eq!(reqs[0]["parallel_tool_calls"], false, "extra_body applied");
+
+        // Turn 2: the tool result went back as a typed item on the right call_id.
+        let input = reqs[1]["input"].as_array().unwrap();
+        let call = input
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("the assistant's call is replayed");
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("the tool result is replayed");
+        assert_eq!(call["call_id"], "call_1");
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(output["output"], "echo: hi");
+
+        // The persisted transcript stays canonical, so a session written by a
+        // Responses run is readable by a chat/completions run and vice versa.
+        let tool_msg = out.messages.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool_msg["tool_call_id"], "call_1");
+        assert_eq!(tool_msg["content"], "echo: hi");
+    }
+
+    #[tokio::test]
+    async fn the_default_wire_format_is_still_chat_completions() {
+        // Nothing that existed before the seam may have moved: a backend built
+        // the old way must still hit /chat/completions.
+        let (srv, seq) = server(vec![text_turn("hi", 5)]).await;
+        let out = backend(&srv.uri(), ModelPolicy::single("m"))
+            .run(req(), EventSink::none())
+            .await
+            .unwrap();
+        assert_eq!(out.content.as_deref(), Some("hi"));
+        assert_eq!(seq.calls(), 1, "served by the /chat/completions mock");
+        assert!(seq.requests()[0]["messages"].is_array());
     }
 }

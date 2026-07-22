@@ -123,6 +123,19 @@ Just want the resilient HTTP without the loop? `ChatClient::post_chat(&json)`
 gives you the timeout + retry on any OpenAI-compatible `chat/completions`
 endpoint.
 
+Talking to a model that needs OpenAI's typed-item endpoint instead:
+
+```rust,ignore
+use agent_loop_core::{Responses, ModelPolicy};
+use std::sync::Arc;
+
+let mut policy = ModelPolicy::single("gpt-5.6-luna");
+policy.extra_body.insert("parallel_tool_calls".into(), false.into());
+
+let backend = ChatBackend::new(chat, tools, policy)
+    .with_wire_format(Arc::new(Responses::new()));
+```
+
 ## What's in it
 
 - **`ChatClient`** — the resilient transport (timeout, connect timeout, retry
@@ -131,6 +144,13 @@ endpoint.
   classified *before* the body is decoded, so a proxy's HTML `502` still retries.
 - **`Tool` / `ToolRegistry`** — typed tools with derived schemas. Runtime-schema
   tools (e.g. MCP) register via `ErasedTool`.
+- **`WireFormat`** — the endpoint schema. `ChatCompletions` (default) and
+  `Responses` ship; the loop and the transcript stay in Chat Completions shape
+  either way, so a session written by one is readable by the other. Reach for
+  `Responses` when a model requires it — OpenAI's `gpt-5.6` family returns 400
+  for function tools on `chat/completions` unless reasoning is disabled, and
+  disabling reasoning ships a different model than the one you benchmarked.
+  Anything the crate doesn't model goes in `ModelPolicy::extra_body`.
 - **`ChatBackend`** — the two-phase loop. Turn cap, token threshold, wall-clock
   timeout, and interrupt are all honored. Reaching the turn cap still runs the
   final synthesis pass (the run reports `MaxTurns`, not `Complete`) — you've

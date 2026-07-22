@@ -56,6 +56,14 @@ pub struct ModelPolicy {
     /// interactive assistant) wants it off, to avoid a redundant call. `single`
     /// defaults it off, `tiered` on; set it explicitly when neither fits.
     pub final_synthesis: bool,
+    /// Extra top-level fields merged into every request body, applied last so
+    /// they win over anything the wire format chose.
+    ///
+    /// The escape hatch for provider parameters this crate does not model.
+    /// jpt-copilot needs `parallel_tool_calls: false` — without it the model
+    /// emits a dependent PSJ call in the same turn as the call whose returned
+    /// ID it needs, which is a real ordering bug, not a preference.
+    pub extra_body: serde_json::Map<String, Value>,
 }
 
 impl Default for ModelPolicy {
@@ -72,6 +80,7 @@ impl Default for ModelPolicy {
             max_history_chars: 45_000,
             continue_on_tool_error: true,
             final_synthesis: false,
+            extra_body: serde_json::Map::new(),
         }
     }
 }
