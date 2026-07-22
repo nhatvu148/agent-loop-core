@@ -39,6 +39,7 @@ pub mod events;
 pub mod loop_runner;
 pub mod provider;
 pub mod tools;
+pub mod wire;
 
 pub use backend::{Backend, ModelPolicy, RunOutcome, RunRequest, extract_json, run_structured};
 pub use error::AgentError;
@@ -46,3 +47,4 @@ pub use events::{AgentEvent, EventSink, StopReason};
 pub use loop_runner::{ChatBackend, trim_history};
 pub use provider::{ChatClient, ProviderConfig, RetryPolicy};
 pub use tools::{ErasedTool, Tool, ToolError, ToolOutput, ToolRegistry};
+pub use wire::{ChatCompletions, Responses, WireFormat, WireRequest};

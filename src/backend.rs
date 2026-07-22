@@ -55,6 +55,12 @@ pub struct ModelPolicy {
     /// caller whose ordinary loop completion already *is* the answer (an
     /// interactive assistant) wants it off, to avoid a redundant call. `single`
     /// defaults it off, `tiered` on; set it explicitly when neither fits.
+    ///
+    /// Provider parameters this crate does not model go in
+    /// [`crate::ChatBackend::with_extra_body`], deliberately *not* a field
+    /// here: `ModelPolicy` has public fields and no `#[non_exhaustive]`, and
+    /// downstream constructs it exhaustively, so every field added to it is a
+    /// compile break for callers who gain nothing from the new field.
     pub final_synthesis: bool,
 }
 
